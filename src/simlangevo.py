@@ -1,5 +1,9 @@
 #!/usr/bin/env python
 
+# ./simlangevo.py  --agent=policy-fnn-obverter  --agent_training=reinforcement  --meanings=Discrete:3  --messages=Binary:3  --num_agents=10  --nn_learning_rate=0.01   --num_generations=201
+
+# ./simlangevo.py  --agent=policy-fnn-obverter  --agent_training=reinforcement  --meanings=Discrete:8  --messages=Binary:3  --num_agents=10  --nn_learning_rate=0.01   --num_generations=501
+
 from __future__ import division
 
 import collections
@@ -11,8 +15,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
-gflags.DEFINE_string('agent', 'fnn+obverter', '')
+gflags.DEFINE_string('agent', 'fnn-obverter', '')
 gflags.DEFINE_string('agent_training', 'supervised', '')
 gflags.DEFINE_string('agent_replacement', 'none', '')
 gflags.DEFINE_string('meanings', 'OneHot:3', '')
@@ -47,7 +52,7 @@ def main(argv):
   print metrics.to_string()
   metrics.plot()
   plt.show()
-  if language:
+  if language is not None:
     PlotDialectMaps(language)
     plt.show()
 
@@ -101,7 +106,7 @@ def _RandomMaxIndex(arr):
   else:
     return _RandomChoice(max_indices)
 
-
+  
 class FeedForwardNetworkObverterAgent(Agent):
 
   @classmethod
@@ -160,7 +165,7 @@ class FeedForwardNetworkObverterAgent(Agent):
       self._optimizer.step()
     finally:
       self._message_to_meaning_fnn.eval()
-
+    
   def _MessageToMeaning(self, message, detach=True):
     message_mb = torch.FloatTensor(message.reshape(1, -1))  # Add batch dim.
     meaning_mb = self._message_to_meaning_fnn(message_mb)
@@ -170,10 +175,71 @@ class FeedForwardNetworkObverterAgent(Agent):
     else:
       return meaning
 
-Agent._AGENT_REGISTRY['fnn+obverter'] = FeedForwardNetworkObverterAgent
+Agent._AGENT_REGISTRY['fnn-obverter'] = FeedForwardNetworkObverterAgent
 
 def _ToBinary(arr):
   return (arr >= .5).astype(np.uint8)
+
+
+class PolicyFeedForwardNetworkObverterAgent(Agent):
+
+  @classmethod
+  def FromFlags(cls):
+    if not FLAGS.nn_hidden_layer_size:
+      message_to_meaning_fnn = torch.nn.Sequential(
+        torch.nn.Linear(MESSAGES.num_bits, len(MEANINGS))
+      )
+    else:
+      message_to_meaning_fnn = torch.nn.Sequential(
+        torch.nn.Linear(MESSAGES.num_bits, FLAGS.nn_hidden_layer_size),
+        torch.nn.ReLU(),
+        torch.nn.Linear(FLAGS.nn_hidden_layer_size, len(MEANINGS))
+      )
+    optimizer = torch.optim.Adam(
+      message_to_meaning_fnn.parameters(), FLAGS.nn_learning_rate)
+    return cls(message_to_meaning_fnn, optimizer)
+
+  def __init__(self, message_to_meaning_fnn, optimizer):
+    self._message_to_meaning_fnn = message_to_meaning_fnn
+    self._optimizer = optimizer
+
+  def Speak(self, meaning):
+    meaning_id = Iterables.Index(MEANINGS, meaning)
+    with torch.no_grad():
+      return max(MESSAGES, key=lambda message: (
+        self._MessageToMeaningScore(message)[meaning_id]))
+
+  def Hear(self, message):
+    with torch.no_grad():
+      meaning_score = self._MessageToMeaningScore(message)
+    return np.random.choice(MEANINGS, p=F.softmax(meaning_score, dim=0).numpy())
+
+  def _MessageToMeaningScore(self, message):
+    message = torch.FloatTensor(message.reshape(1, -1))
+    return self._message_to_meaning_fnn(message).view(-1).detach()
+
+  def LearnToHearReinforced(self, messages, hearer_meanings, rewards):
+    self._message_to_meaning_fnn.train()
+    # self is hearer, the agent that mapped message to hearer_meaning.
+    # In reinforcement learning terms:
+    #   message - state / observation
+    #   hearer_meaning - agent's action in response to messsage
+    n = len(messages)
+    assert n == len(messages) == len(hearer_meanings) == len(rewards)
+
+    meaning_scores = self._message_to_meaning_fnn(torch.FloatTensor(messages))
+    meaning_log_probas = F.log_softmax(meaning_scores, dim=1)
+    meaning_ids = [Iterables.Index(MEANINGS, m) for m in hearer_meanings]
+    selected_meaning_log_probas = meaning_log_probas[np.arange(n), meaning_ids]
+    loss = -(torch.FloatTensor(rewards) * selected_meaning_log_probas).mean()
+    
+    self._optimizer.zero_grad()
+    loss.backward()
+    self._optimizer.step()
+
+    self._message_to_meaning_fnn.eval()
+
+Agent._AGENT_REGISTRY['policy-fnn-obverter'] = PolicyFeedForwardNetworkObverterAgent
 
 
 class AgentTraining(object):
@@ -202,12 +268,22 @@ class AgentSupervisedTraining(AgentTraining):
 
 class AgentReinforcementTraining(AgentTraining):
 
-  def TrainAgents(self, communication_act):
-    reward = None  # TODO
-    communication_act.speaker.LearnReinforced(
-      communication_act.speaker_meaning, communication_act.message, reward)
-    communication_act.hearer.LearnReinforced(
-      communication_act.message, communication_act.hearer_meaning, reward)
+  def TrainAgents(self, communication_acts):
+    # for speaker, speaker_acts in Iterables.GroupBy(communication_acts, lambda ca: ca.speaker):
+    #   speaker.LearnToSpeakReinforced(
+    #     [sa.speaker_meaning for sa in speaker_acts],
+    #     [sa.message for sa in speaker_acts],
+    #     [self._ComputeReward(sa) for sa in speaker_acts])
+    for hearer, hearer_acts in Iterables.GroupBy(communication_acts, lambda ca: ca.hearer):
+      hearer.LearnToHearReinforced(
+        [ha.message for ha in hearer_acts],
+        [ha.hearer_meaning for ha in hearer_acts],
+        [self._ComputeReward(ha) for ha in hearer_acts])
+
+  @staticmethod
+  def _ComputeReward(communication_act):
+    return int(MEANINGS.Equal(
+      communication_act.speaker_meaning, communication_act.hearer_meaning))
 
 
 class Space(object):
@@ -223,6 +299,11 @@ class Space(object):
     elif args[0] == 'OneHot':
       num_bits = int(args[1])
       return BinaryVectorSpace(np.eye(num_bits, dtype=np.uint8))
+    elif args[0] == 'Discrete':
+      num_elements = int(args[1])
+      return DiscreteSpace(np.arange(num_elements))
+    else:
+      raise ValueError(spec)
 
   def __len__(self):
     raise NotImplementedError
@@ -252,6 +333,21 @@ class BinaryVectorSpace(Space):
   @staticmethod
   def Equal(a, b):
     return (a == b).all()
+
+class DiscreteSpace(Space):
+
+  def __init__(self, elements):
+    self._elements = elements
+
+  def __len__(self):
+    return len(self._elements)
+
+  def __getitem__(self, i):
+    return self._elements[i]
+
+  @staticmethod
+  def Equal(a, b):
+    return a == b
 
 
 class MeaningSpace(Space):
@@ -298,10 +394,13 @@ class IteratedLearning(object):
     metrics_per_generation = []
 
     for generation_id in xrange(num_generations):
-      # Have agents communicate and learn in pairs.
-      for _ in xrange(self._num_communication_acts):
-        communication_act = self._DoCommunicationAct()
-        self._agent_training.TrainAgents(communication_act)
+      # Have agents communicate in pairs. Generate communication samples.
+      communication_acts = [
+        self._DoCommunicationAct()
+        for _ in xrange(self._num_communication_acts)]
+
+      # Have each agent learn from his samples.
+      self._agent_training.TrainAgents(communication_acts)
 
       # Update agent population.
       self._agents, new_agents = (
@@ -428,9 +527,7 @@ class CommunicationAccuracy(Metric):
       hearer_meaning = hearer.Hear(speaker.Speak(speaker_meaning))
       num_successful += int(MEANINGS.Equal(speaker_meaning, hearer_meaning))
     return num_successful / self._num_samples
-
-  
-
+ 
 
 def PlotDialectMaps(language):
   # language: generations x meanings x agents x message bits
@@ -468,6 +565,26 @@ class Dicts(object):
   def ToString(cls, d):
     # TODO: Formatting.
     return ' '.join(['%s=%s' % (k, v) for k, v in sorted(d.items())])
+
+
+class Iterables(object):
+        
+  @classmethod
+  def Index(cls, iterable, key):
+    for i, e in enumerate(iterable):
+      if e == key:
+        return i
+    raise KeyError(key)
+
+  @classmethod
+  def GroupBy(cls, iterable, key, sorted=False):
+    if not sorted:
+      key_to_elements = collections.defaultdict(list)
+      for e in iterable:
+        key_to_elements[key(e)].append(e)
+      return key_to_elements.iteritems()
+    else:
+      raise NotImplementedError  # TODO: itertools.groupby.
 
 
 def _RandomChoice(arr, size=None, replace=True):
