@@ -1,8 +1,52 @@
 #!/usr/bin/env python
 
-# ./simlangevo.py  --agent=policy-fnn-obverter  --agent_training=reinforcement  --meanings=Discrete:3  --messages=Binary:3  --num_agents=10  --nn_learning_rate=0.01   --num_generations=201
+"""Simulation of language evolution.
 
-# ./simlangevo.py  --agent=policy-fnn-obverter  --agent_training=reinforcement  --meanings=Discrete:8  --messages=Binary:3  --num_agents=10  --nn_learning_rate=0.01   --num_generations=501
+See https://docs.google.com/document/d/1HMq4m5xd_ggTzM7XJiXOSbDRTT2jQ5foSlB2aZEw6GM
+"""
+
+# Configurations reported in the doc, in the Results section.
+# Note default command-line flag values, in flag definitions below.
+#
+# # Configuration #1
+#
+# ./simlangevo.py  \
+#   --agent=fnn-obverter  \
+#   --agent_training=supervised  \
+#   --meanings=OneHot:3  \
+#   --messages=Binary:3 \
+#   --num_generations=121
+#
+# # Configuration #2
+#
+# ./simlangevo.py  \
+#   --agent=fnn-obverter  \
+#   --agent_training=supervised  \
+#   --meanings=Binary:3  \
+#   --messages=Binary:3  \
+#   --num_generations=151
+#
+# # Configuration #3
+#
+# ./simlangevo.py  \
+#   --agent=policy-fnn-obverter  \
+#   --agent_training=reinforcement  \
+#   --meanings=Discrete:3  \
+#   --messages=Binary:3  \
+#   --num_agents=10  \
+#   --nn_learning_rate=0.01  \
+#   --num_generations=201
+#
+# # Configuration #4
+#
+# ./simlangevo.py  \
+#   --agent=policy-fnn-obverter  \
+#   --agent_training=reinforcement  \
+#   --meanings=Discrete:8  \
+#   --messages=Binary:3  \
+#   --num_agents=10  \
+#   --nn_learning_rate=0.01  \
+#   --num_generations=501
 
 from __future__ import division
 
@@ -17,6 +61,9 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
+
+# Command-line flag definitions. Agent / simulation / environment parameters.
+# Roughly correspond to the Parameters section in the doc.
 gflags.DEFINE_string('agent', 'fnn-obverter', '')
 gflags.DEFINE_string('agent_training', 'supervised', '')
 gflags.DEFINE_string('agent_replacement', 'none', '')
@@ -35,20 +82,25 @@ FLAGS = gflags.FLAGS
 
 
 def main(argv):
-  argv = FLAGS(argv)
+  """Executable entry point. Sets up and runs a simulation of lang evolution."""
+  argv = FLAGS(argv)  # Parse command-line flags.
 
+  # Fix random seed for reproducibility.
   random.seed(1)
   np.random.seed(1)
   torch.manual_seed(1)
 
+  # Instantiate meaning and message spaces.
   global MEANINGS, MESSAGES  # TODO: Clean up.
   MEANINGS = MeaningSpace.FromFlags()
   MESSAGES = MessageSpace.FromFlags()
 
+  # Run the simulation.
   language, metrics = (
     IteratedLearning.FromFlags().
     Run(FLAGS.num_generations, FLAGS.record_language))
-
+  
+  # Print / plot metrics and other simulation result summaries.
   print metrics.to_string()
   metrics.plot()
   plt.show()
@@ -58,35 +110,84 @@ def main(argv):
 
 
 class Agent(object):
+  """An agent that communicates with other agents and learns a shared language.
+
+  Abstract interface.
+  """
 
   @classmethod
   def FromFlags(cls):
+    """Creates an instance specified by flags."""
     return cls._AGENT_REGISTRY[FLAGS.agent].FromFlags()
 
   def Speak(self, meaning):
+    """Makes the agent say / produce a message, the one it maps the meaning to.
+
+    Args:
+      meaning: element of MeaningSpace. Meaning to say.
+    Returns:
+      Element of MessageSpace. Message encoding the meaning.
+    """
     raise NotImplementedError
 
   def Hear(self, message):
+    """Makes the agent hear / recover a meaning, the one it maps the message to.
+
+    Args:
+      message: element of MessageSpace. Received message.
+    Returns:
+      Element of MeaningSpace. Recovered meaning.
+    """
     raise NotImplementedError
 
+  # Registry of Agent implementations (subclasses).
+  # Human-readable string Agent class specification -> Agent subclass.
   _AGENT_REGISTRY = {}
 
 
 class HebbianAgent(Agent):
+  """An agent with a 2D meaning x message matrix, trained with Hebbian rule.
+
+  The matrix holds the (meaning, message) association strength for each pair.
+  It specifies both meaning -> message and message -> meaning mappings:
+    meaning -> message (Speak): the agent looks at the matrix row corresponding
+      to the meaning and takes the message (column) with the highest value.
+    message -> meaning (Hear): the agent looks at the matrix column corresponding
+      to the message and takes the meaning (row) with the highest value.
+
+    If the highest value is tied between more than one column / row (more than
+    one candidate), one is picked at random.
+
+  Learning consists in strengthening the association for a given
+  (meaning, message) pair, by increasing the number in the appropriate matrix
+  cell, and optionally weaking alternative associations, by decreasing other
+  numbers in the same column and row ("lateral inhibition").
+
+  Source: github.com/smkirby/SimLang/blob/master/simlang_13_lab.ipynb
+  """
 
   @classmethod
   def FromFlags(cls):
-    return cls()
-
-  def __init__(self):
-    self._meaning_message_weights = (
+    """See base class."""
+    meaning_message_associations = (
       np.zeros((len(MEANINGS), len(MESSAGES)), dtype=np.uint))
+    return cls(meaning_message_associations)
+
+  def __init__(self, meaning_message_associations):
+    """Constructor.
+
+    Args:
+      meaning_message_associations: np.NDArray, rows: meanings, cols: messages.
+    """
+    self._meaning_message_associations = meaning_message_associations
 
   def Speak(self, meaning):
-    return _RandomMaxIndex(self._meaning_message_weights[meaning])
+    """See base class."""
+    return _RandomMaxIndex(self._meaning_message_associations[meaning])
 
   def Hear(self, message):
-    return _RandomMaxIndex(self._meaning_message_weights[:, message])
+    """See base class."""
+    return _RandomMaxIndex(self._meaning_message_associations[:, message])
 
   # TODO: Adapt to AgentTraining interface:
   #   def LearnUnsupervised(self, speaker_meaning, message)
@@ -94,12 +195,22 @@ class HebbianAgent(Agent):
     for _ in range(num_epochs):
       for __ in enumerate(meaning_message_pairs):
         meaning, message = _RandomChoice(meaning_message_pairs)
-        self._meaning_message_weights[meaning, message] += 1
+        self._meaning_message_associations[meaning, message] += 1
         # TODO: inhibition
 
 Agent._AGENT_REGISTRY['hebbian'] = HebbianAgent
 
 def _RandomMaxIndex(arr):
+  """Returns the index of the maximum value in the array.
+
+  If there are multiple maximum values, returns the index of one of them
+  at random.
+
+  Args:
+    arr: np.NDArray.
+  Returns:
+    int. The index.
+  """
   max_indices = np.argwhere(arr == arr.max()).flatten()
   if len(max_indices) == 1:
     return max_indices[0]
@@ -108,15 +219,38 @@ def _RandomMaxIndex(arr):
 
   
 class FeedForwardNetworkObverterAgent(Agent):
+  """An agent with a feed-forward neural network decoding message -> meaning.
+
+  meaning -> message mapping is derived from message -> meaning mapping via
+  obverter procedure (inverting the latter by evaluating all possible messages
+  and taking the message that produces the closest meaning).
+
+  The message -> meaning network is trained in supervised fashion, from
+  (speaker / intended meaning, message, hearer / recovered meaning) triplets,
+  acting as (target output, input, predicted output) respectively. The agent
+  directly improves its capacity to hear, and indirectly its capacity to speak
+  (by obverting the improved hearing network).
+
+  The agent assumes structured messages and meanings, each consisting of
+  a number of bits that map to input and output neurons, respectively.
+  The network learns / discovers this structure.
+
+  Source:
+    feed-forward network: TODO.
+    obverter: TODO.
+  """
 
   @classmethod
   def FromFlags(cls):
-    if not FLAGS.nn_hidden_layer_size:
+    """See base class."""
+    # Instantiate network architecture, possibly including a hidden layer,
+    # depending on --nn_hidden_layer_size.
+    if not FLAGS.nn_hidden_layer_size:  # layers: input, output
       message_to_meaning_fnn = torch.nn.Sequential(
         torch.nn.Linear(MESSAGES.num_bits, MEANINGS.num_bits),
         torch.nn.Sigmoid()
       )
-    else:
+    else:  # layers: input, hidden, output
       message_to_meaning_fnn = torch.nn.Sequential(
         torch.nn.Linear(MESSAGES.num_bits, FLAGS.nn_hidden_layer_size),
         torch.nn.Sigmoid(),
@@ -128,10 +262,17 @@ class FeedForwardNetworkObverterAgent(Agent):
     return cls(message_to_meaning_fnn, optimizer)
 
   def __init__(self, message_to_meaning_fnn, optimizer):
+    """Constructor.
+
+    Args:
+      message_to_meaning_fnn: torch.nn.Module. Message -> meaning decoder.
+      optimizer: torch.optim.Optim. Network training, bound to the above object.
+    """
     self._message_to_meaning_fnn = message_to_meaning_fnn
     self._optimizer = optimizer
 
   def Speak(self, meaning):
+    """See base class."""
     with torch.no_grad():
       # Obverter: To say given meaning, the speaker picks the message that
       # he himself associates most closely with (maps to) the meaning
@@ -141,10 +282,12 @@ class FeedForwardNetworkObverterAgent(Agent):
         self._MessageToMeaning(message), meaning))
 
   def Hear(self, message):
+    """See base class."""
     with torch.no_grad():
       return _ToBinary(self._MessageToMeaning(message))
 
   def LearnSupervised(self, speaker_meaning, message, hearer_meaning):
+    """See base class."""  # TOOD: SupervisedLearnerMixin.
     # self is hearer, the agent that mapped message to hearer_meaning.
     # In supervised learning terms:
     #   message - x
@@ -167,6 +310,15 @@ class FeedForwardNetworkObverterAgent(Agent):
       self._message_to_meaning_fnn.eval()
     
   def _MessageToMeaning(self, message, detach=True):
+    """Maps given message to meaning. Handles PyTorch network invocation.
+
+    Args:
+      message: element of MessageSpace. Message to map.
+      detach: bool. If False, the meaning is not detached from PyTorch
+        computation graph, allowing to use the meaning tensor for training.
+    Returns:
+      Element of MeaningSpace. Meaning mapped to message.
+    """
     message_mb = torch.FloatTensor(message.reshape(1, -1))  # Add batch dim.
     meaning_mb = self._message_to_meaning_fnn(message_mb)
     meaning = meaning_mb.view(-1)  # Drop batch dimension.
@@ -178,18 +330,38 @@ class FeedForwardNetworkObverterAgent(Agent):
 Agent._AGENT_REGISTRY['fnn-obverter'] = FeedForwardNetworkObverterAgent
 
 def _ToBinary(arr):
+  """Binarizes given array with numerical values to binary 0-1 values."""
   return (arr >= .5).astype(np.uint8)
 
 
 class PolicyFeedForwardNetworkObverterAgent(Agent):
+  """An agent with a feed-forward policy network p(meaning|message) for decoding.
+
+  meaning -> message mapping is derived from message -> meaning via obverter;
+  see FeedForwardNetworkObverterAgent for details.
+
+  The message -> meaning policy network is trained via REINFORCE algorithm,
+  from (message, hearer / recovered meaning, reward) triplets.
+
+  The agent assumes structured messages, each consisting of a number of bits
+  that map to input neurons. The output layer has one neuron for each possible
+  meaning, which is transformed to meaning probabilities with a softmax.
+
+  Source:
+    policy network, REINFORCE: TODO.
+    obverter: TODO.
+  """
 
   @classmethod
   def FromFlags(cls):
-    if not FLAGS.nn_hidden_layer_size:
+    """See base class."""
+    # Instantiate network architecture, possibly including a hidden layer,
+    # depending on --nn_hidden_layer_size.
+    if not FLAGS.nn_hidden_layer_size:  # layers: input, output
       message_to_meaning_fnn = torch.nn.Sequential(
         torch.nn.Linear(MESSAGES.num_bits, len(MEANINGS))
       )
-    else:
+    else:  # layers: input, hidden, output
       message_to_meaning_fnn = torch.nn.Sequential(
         torch.nn.Linear(MESSAGES.num_bits, FLAGS.nn_hidden_layer_size),
         torch.nn.ReLU(),
@@ -200,26 +372,48 @@ class PolicyFeedForwardNetworkObverterAgent(Agent):
     return cls(message_to_meaning_fnn, optimizer)
 
   def __init__(self, message_to_meaning_fnn, optimizer):
+    """Constructor.
+
+    Args:
+      message_to_meaning_fnn: torch.nn.Module. Message -> meaning decoder.
+      optimizer: torch.optim.Optim. Network training, bound to the above object.
+    """
     self._message_to_meaning_fnn = message_to_meaning_fnn
     self._optimizer = optimizer
 
   def Speak(self, meaning):
+    """See base class."""
     meaning_id = Iterables.Index(MEANINGS, meaning)
     with torch.no_grad():
+      # Obverter: To say given meaning, evaluate all messages and use the
+      # message for which the score for the given meaning is the highest.
       return max(MESSAGES, key=lambda message: (
         self._MessageToMeaningScore(message)[meaning_id]))
 
   def Hear(self, message):
+    """See base class."""
     with torch.no_grad():
+      # Compute meaning distribution.
       meaning_score = self._MessageToMeaningScore(message)
-    return np.random.choice(MEANINGS, p=F.softmax(meaning_score, dim=0).numpy())
+    # Sample a meaning from computed distribution.
+    meaning_proba = F.softmax(meaning_score, dim=0)
+    return np.random.choice(MEANINGS, p=meaning_proba.numpy())
 
   def _MessageToMeaningScore(self, message):
+    """Computes score distribution over possible meanings, given message.
+
+    Handles PyTorch network invocation.
+
+    Args:
+      message: element of MessageSpace. Message to compute meaning scores for.
+    Returns:
+      torch.FloatTensor. Score distribution over meanings.
+    """
     message = torch.FloatTensor(message.reshape(1, -1))
     return self._message_to_meaning_fnn(message).view(-1).detach()
 
   def LearnToHearReinforced(self, messages, hearer_meanings, rewards):
-    self._message_to_meaning_fnn.train()
+    """See base class."""  # TOOD: ReinforcementLearnerMixin.
     # self is hearer, the agent that mapped message to hearer_meaning.
     # In reinforcement learning terms:
     #   message - state / observation
@@ -227,6 +421,9 @@ class PolicyFeedForwardNetworkObverterAgent(Agent):
     n = len(messages)
     assert n == len(messages) == len(hearer_meanings) == len(rewards)
 
+    self._message_to_meaning_fnn.train()
+
+    # REINFORCE algorithm.
     meaning_scores = self._message_to_meaning_fnn(torch.FloatTensor(messages))
     meaning_log_probas = F.log_softmax(meaning_scores, dim=1)
     meaning_ids = [Iterables.Index(MEANINGS, m) for m in hearer_meanings]
@@ -242,7 +439,9 @@ class PolicyFeedForwardNetworkObverterAgent(Agent):
 Agent._AGENT_REGISTRY['policy-fnn-obverter'] = PolicyFeedForwardNetworkObverterAgent
 
 
+# TODO: Clean up.
 class AgentTraining(object):
+  """Agent training method. Calls relevant Agent method, eg. LearnSupervised."""
 
   @classmethod
   def FromFlags(cls):
@@ -287,9 +486,17 @@ class AgentReinforcementTraining(AgentTraining):
 
 
 class Space(object):
+  """A space of objects, as in mathematics. Abstract interface."""
 
   @classmethod
   def Create(cls, spec):
+    """Creates an instance from a string specification.
+
+    Args:
+      spec: str. Space specificiation.
+    Returns:
+      Space instance.
+    """
     args = spec.split(':')
     if args[0] == 'Binary':
       num_bits = int(args[1])
@@ -305,6 +512,8 @@ class Space(object):
     else:
       raise ValueError(spec)
 
+  # __len__ and __getiem__ allow iterating and samlping.
+
   def __len__(self):
     raise NotImplementedError
 
@@ -312,8 +521,14 @@ class Space(object):
     raise NotImplementedError
 
 class BinaryVectorSpace(Space):
+  """Space of binary vectors {0,1}^n of fixed number of bits n."""
 
   def __init__(self, vectors):
+    """Constructor.
+
+    Args:
+      vectors: np.NDArray, 2D. Rows are vectors in the space.
+    """
     self._vectors = vectors
 
   def __len__(self):
@@ -328,43 +543,78 @@ class BinaryVectorSpace(Space):
 
   @staticmethod
   def Distance(a, b):
+    """Computes distance between two vectors.
+
+    Args:
+      a, b: binary vectors. Elements of the space.
+    Returns:
+      float.
+    """
     return ((a - b)**2).mean()
 
   @staticmethod
   def Equal(a, b):
+    """Whether two vectors are equal.
+
+    Args:
+      a, b: binary vectors. Elements of the space.
+    Returns:
+      bool.
+    """
     return (a == b).all()
 
 class DiscreteSpace(Space):
+  """Space of distinct discrete symbols with abstract / unspecified semantics."""
 
-  def __init__(self, elements):
-    self._elements = elements
+  def __init__(self, symbols):
+    """Constructor.
+
+    Args:
+      symbols: array-like of symbols.
+    """
+    self._symbols = symbols
 
   def __len__(self):
-    return len(self._elements)
+    return len(self._symbols)
 
   def __getitem__(self, i):
-    return self._elements[i]
+    return self._symbols[i]
 
   @staticmethod
   def Equal(a, b):
+    """Whether two symbols are equal.
+
+    Args:
+      a, b: symbols. Elements of the space.
+    Returns:
+      bool.
+    """
     return a == b
 
 
 class MeaningSpace(Space):
+  """Meaning space. All possible meanings that agents might refer to."""
+
   @classmethod
   def FromFlags(cls):
+    """Creates an instance specified by flags."""
     return cls.Create(FLAGS.meanings)
                         
 class MessageSpace(Space):
+  """Message space. All possible messages that agents might say."""
+
   @classmethod
   def FromFlags(cls):
+    """Creates an instance specified by flags."""
     return cls.Create(FLAGS.messages)
 
 
 class IteratedLearning(object):
+  """Simulation of language evolution algorithm / main loop."""
 
   @classmethod
   def FromFlags(cls):
+    """Creates an instance specified by flags."""
     agent_factory = Agent.FromFlags
     agents = [agent_factory() for _ in range(FLAGS.num_agents)]
     return cls(
@@ -378,6 +628,16 @@ class IteratedLearning(object):
                agents, agent_training, agent_replacement_strategy,
                num_communication_acts,
                metrics):
+    """Constructor.
+
+    Args:
+      agents: list of Agent. Communicate, learn, get replaced between generations.
+      agent_training: AgentTraining. Training method. Must be supported by agents.
+      agent_replacement_strategy: AgentReplacementStrategy.
+      num_communication_acts: int. Number of communication acts per generation
+        to sample / generate.
+      metrics: list of Metric. Metrics to compute every few generations.
+    """
     self._agents = agents
     self._agent_training = agent_training
     self._agent_replacement_strategy = agent_replacement_strategy
@@ -385,6 +645,15 @@ class IteratedLearning(object):
     self._metrics = metrics
 
   def Run(self, num_generations, record_language):
+    """Runs the simulation main loop.
+
+    Args:
+      num_generations: int. Number of generations to run the simulation for.
+    Returns:
+      language: np.NDArray (generations x meanings x agents x message bits),
+      metrics: pd.DataFrame, columns: metrics, index: generation ids
+    """
+    # Allocate placeholders for return values.
     if record_language:
       language = np.empty(
         (num_generations, len(MEANINGS), len(self._agents), MESSAGES.num_bits),
@@ -424,6 +693,14 @@ class IteratedLearning(object):
     return language, metrics_df
 
   def _DoCommunicationAct(self):
+    """Makes an agent communicate a meaning to another agent via a message.
+
+    Samples a speaker agent, a hearer agent and a meaning. Makes the speaker
+    say the meaning and the hearer recover a meaning. Records these 5 pieces.
+
+    Returns:
+      CommunicationAct. A record of the above communication
+    """
     speaker, hearer = _RandomChoice(self._agents, 2, replace=False)
     speaker_meaning = _RandomChoice(MEANINGS)  # TODO: Subset of meanings, agent choice.
     message = speaker.Speak(speaker_meaning)
@@ -436,6 +713,10 @@ class IteratedLearning(object):
       metric.name: metric.Compute(self._agents)
       for metric in self._metrics}
 
+"""A record of the following communication act:
+
+meaning  -- speaker.Speak(.) -->  message  -- hearer.Hear(.)  -->  meaning
+"""
 CommunicationAct = collections.namedtuple('CommunicationAct', [
   'speaker', 'hearer', 'speaker_meaning', 'message', 'hearer_meaning'])
 
@@ -597,10 +878,6 @@ def _RandomChoice(arr, size=None, replace=True):
       return arr[i]
     else:
       return random.sample(arr, size)
-
-
-def _DumpArray(arr, fmt='%u'):
-  np.savetxt(sys.stdout, arr, fmt=fmt)
 
 
 if __name__ == '__main__':
