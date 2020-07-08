@@ -48,9 +48,12 @@ See https://docs.google.com/document/d/1HMq4m5xd_ggTzM7XJiXOSbDRTT2jQ5foSlB2aZEw
 #   --nn_learning_rate=0.01  \
 #   --num_generations=501
 
+# ./simlangevo.py   --agent=encoder-decoder-rnns  --agent_training=joint-supervised  --meanings=OneHot:3  --messages=Discrete:2  --max_message_length=8  --num_agents=10   --record_language=false  --nn_learning_rate=0.01
+
 from __future__ import division
 
 import collections
+import operator
 import random
 import sys
 
@@ -69,6 +72,7 @@ gflags.DEFINE_string('agent_training', 'supervised', '')
 gflags.DEFINE_string('agent_replacement', 'none', '')
 gflags.DEFINE_string('meanings', 'OneHot:3', '')
 gflags.DEFINE_string('messages', 'Binary:3', '')
+gflags.DEFINE_integer('max_message_length', None, '')
 gflags.DEFINE_integer('num_agents', 100, '')
 gflags.DEFINE_integer('num_generations', 501, '')
 gflags.DEFINE_integer('num_generations_between_metrics', 10, '')
@@ -217,8 +221,24 @@ def _RandomMaxIndex(arr):
   else:
     return _RandomChoice(max_indices)
 
+
+class SupervisedLearner(object):
+
+  def LearnToHearSupervised(self, messages, hearer_meanings, speaker_meanings):
+    """Trains the agent to hear (decode message->meaning) in a supervised manner,
+
+    from (message, hearer / recovered meaning, speaker / intended meaning)
+    triplets, acting as (input, predicted output, target output) respectively.
+
+    Args:
+      messages: list of MessageSpace elements. Messages.
+      hearer_meanings: list of MeaningSpace elements. Hearer meanings.
+      speaker_meanings: list of MeaningSpace elements. Speaker meanings.
+    """
+    raise NotImplementedError
+
   
-class FeedForwardNetworkObverterAgent(Agent):
+class FeedForwardNetworkObverterAgent(Agent, SupervisedLearner):
   """An agent with a feed-forward neural network decoding message -> meaning.
 
   meaning -> message mapping is derived from message -> meaning mapping via
@@ -286,8 +306,8 @@ class FeedForwardNetworkObverterAgent(Agent):
     with torch.no_grad():
       return _ToBinary(self._MessageToMeaning(message))
 
-  def LearnSupervised(self, speaker_meaning, message, hearer_meaning):
-    """See base class."""  # TOOD: SupervisedLearnerMixin.
+  def LearnToHearSupervised(self, messages, hearer_meanings, speaker_meanings):
+    """See base class."""
     # self is hearer, the agent that mapped message to hearer_meaning.
     # In supervised learning terms:
     #   message - x
@@ -295,43 +315,116 @@ class FeedForwardNetworkObverterAgent(Agent):
     #   speaker_meaning - y (target)
     try:
       self._message_to_meaning_fnn.train()
-      # Original hearer_meaning, real numbers from [0, 1] not binary,
+      # Raw network hearer_meanings, float tensors in [0, 1] not binary,
       # not detached from the computation graph (allowing to compute gradient
       # of network weights).
       # TODO: Retain at source, in Hear().
-      hearer_meaning = self._MessageToMeaning(message, detach=False)
+      hearer_meanings = self._message_to_meaning_fnn(torch.FloatTensor(messages))
       # Wrap in tensor, needed for further operations on hearer_meaning.
-      speaker_meaning = torch.tensor(speaker_meaning, dtype=torch.uint8)
-      loss = MEANINGS.Distance(speaker_meaning, hearer_meaning)
+      speaker_meanings = torch.tensor(speaker_meanings, dtype=torch.uint8)
+      loss = MEANINGS.Distance(speaker_meanings, hearer_meanings).mean()
       self._optimizer.zero_grad()
       loss.backward()
       self._optimizer.step()
     finally:
       self._message_to_meaning_fnn.eval()
+
+  @classmethod
+  def LearnSpeakerHearerSupervised(
+      cls, speaker, hearer, speaker_meaning, message, hearer_meaning):
+    speaker_meaning = torch.tensor(speaker_meaning, dtype=torch.uint8)
+    loss = MEANINGS.Distance(speaker_meaning, hearer_meaning)
+    speaker._encoder_optimizer.zero_grad()
+    hearer._decoder_optimizer.zero_grad()
+    loss.backward()
+    speaker._encoder_optimizer.step()
+    hearer._decoder_optimizer.step()
     
-  def _MessageToMeaning(self, message, detach=True):
+  def _MessageToMeaning(self, message):
     """Maps given message to meaning. Handles PyTorch network invocation.
 
     Args:
       message: element of MessageSpace. Message to map.
-      detach: bool. If False, the meaning is not detached from PyTorch
-        computation graph, allowing to use the meaning tensor for training.
     Returns:
       Element of MeaningSpace. Meaning mapped to message.
     """
     message_mb = torch.FloatTensor(message.reshape(1, -1))  # Add batch dim.
     meaning_mb = self._message_to_meaning_fnn(message_mb)
     meaning = meaning_mb.view(-1)  # Drop batch dimension.
-    if detach:
-      return meaning.detach().numpy()
-    else:
-      return meaning
+    return meaning.detach().numpy()
 
 Agent._AGENT_REGISTRY['fnn-obverter'] = FeedForwardNetworkObverterAgent
 
 def _ToBinary(arr):
   """Binarizes given array with numerical values to binary 0-1 values."""
   return (arr >= .5).astype(np.uint8)
+
+
+class FeedForwardNetworksAgent(Agent, SupervisedLearner):
+
+  @classmethod
+  def FromFlags(cls):
+    """See base class."""
+    # Instantiate network architecture, possibly including a hidden layer,
+    # depending on --nn_hidden_layer_size.
+    if not FLAGS.nn_hidden_layer_size:  # layers: input, output
+      encoder_fnn = torch.nn.Sequential(
+        torch.nn.Linear(MEANINGS.num_bits, MESSAGES.num_bits),
+        torch.nn.Sigmoid()
+      )
+      decoder_fnn = torch.nn.Sequential(
+        torch.nn.Linear(MESSAGES.num_bits, MEANINGS.num_bits),
+        torch.nn.Sigmoid()
+      )
+    else:  # layers: input, hidden, output
+      encoder_fnn = torch.nn.Sequential(
+        torch.nn.Linear(MEANINGS.num_bits, FLAGS.nn_hidden_layer_size),
+        torch.nn.Sigmoid(),
+        torch.nn.Linear(FLAGS.nn_hidden_layer_size, MESSAGES.num_bits),
+        torch.nn.Sigmoid()
+      )
+      decoder_fnn = torch.nn.Sequential(
+        torch.nn.Linear(MESSAGES.num_bits, FLAGS.nn_hidden_layer_size),
+        torch.nn.Sigmoid(),
+        torch.nn.Linear(FLAGS.nn_hidden_layer_size, MEANINGS.num_bits),
+        torch.nn.Sigmoid()
+      )
+    encoder_optimizer = torch.optim.Adam(
+      encoder_fnn.parameters(), FLAGS.nn_learning_rate)
+    decoder_optimizer = torch.optim.Adam(
+      decoder_fnn.parameters(), FLAGS.nn_learning_rate)
+    return cls(encoder_fnn, decoder_fnn, encoder_optimizer, decoder_optimizer)
+
+  def __init__(self, encoder_fnn, decoder_fnn,
+               encoder_optimizer, decoder_optimizer):
+    self._encoder_fnn = encoder_fnn
+    self._decoder_fnn = decoder_fnn
+    self._encoder_optimizer = encoder_optimizer
+    self._decoder_optimizer = decoder_optimizer
+
+  def Speak(self, meaning):
+    """See base class."""
+    meaning_mb = torch.FloatTensor(meaning.reshape(1, -1))
+    return self._encoder_fnn(meaning_mb).view(-1)
+    # TODO: Binarize.
+
+  def Hear(self, message):
+    """See base class."""
+    message_mb = torch.FloatTensor(message.reshape(1, -1))
+    return self._decoder_fnn(message_mb).view(-1)
+
+  @classmethod
+  def LearnSpeakerHearerSupervised(
+      cls, speaker, hearer, speaker_meaning, message, hearer_meaning):
+    speaker_meaning = torch.tensor(speaker_meaning, dtype=torch.uint8)
+    loss = MEANINGS.Distance(speaker_meaning, hearer_meaning)
+    speaker._encoder_optimizer.zero_grad()
+    hearer._decoder_optimizer.zero_grad()
+    loss.backward()
+    speaker._encoder_optimizer.step()
+    hearer._decoder_optimizer.step()
+
+Agent._AGENT_REGISTRY['fnns'] = FeedForwardNetworksAgent
 
 
 class PolicyFeedForwardNetworkObverterAgent(Agent):
@@ -439,14 +532,148 @@ class PolicyFeedForwardNetworkObverterAgent(Agent):
 Agent._AGENT_REGISTRY['policy-fnn-obverter'] = PolicyFeedForwardNetworkObverterAgent
 
 
+class EncoderDecoderRecurrentNetworksAgent(Agent):
+
+  # TODO: NLL.
+  # TODO: LSTM?
+  # TODO: RNN inputs as in Havrylov & Titov.
+
+  @classmethod
+  def FromFlags(cls):
+    encoder_rnn = RNN.Create(
+      len(MEANINGS), FLAGS.nn_hidden_layer_size, len(cls._VOCABULARY) + 1)
+    decoder_rnn = RNN.Create(
+      len(cls._VOCABULARY), FLAGS.nn_hidden_layer_size, len(MEANINGS))
+    return cls(
+      encoder_rnn,
+      decoder_rnn,
+      torch.optim.Adam(encoder_rnn.parameters(), FLAGS.nn_learning_rate),
+      torch.optim.Adam(decoder_rnn.parameters(), FLAGS.nn_learning_rate),
+      FLAGS.max_message_length,
+      FLAGS.nn_hidden_layer_size)
+
+  def __init__(self, encoder_rnn, decoder_rnn,
+               encoder_optimizer, decoder_optimizer,
+               max_message_length, hidden_size):
+    self._encoder_rnn = encoder_rnn
+    self._decoder_rnn = decoder_rnn
+    self._encoder_optimizer = encoder_optimizer
+    self._decoder_optimizer = decoder_optimizer
+    self._max_message_length = max_message_length
+    self._hidden_size = hidden_size
+
+  def Speak(self, meaning):
+    assert isinstance(meaning, np.ndarray), 'must be a vector'
+    message = []
+    meaning = torch.FloatTensor(meaning).view(1, -1)
+    hidden = None
+    while len(message) < self._max_message_length:
+      output_c_proba, hidden = self._encoder_rnn(meaning, hidden)
+      output_c_proba = output_c_proba.view(-1)
+      # output_c = ...
+      # if output_c == START_END:
+      #   break
+      if message:
+        if output_c_proba.argmax().item() == len(self._VOCABULARY):
+          break
+      message.append(output_c_proba[:len(self._VOCABULARY)])
+    return message  # list of c_proba
+
+  def Hear(self, message):
+    hidden = None
+    for c in message:
+      # c = _OneHot(c.argmax().item(), len(self._VOCABULARY), torch, torch.float)
+      # output - one-hot
+      meaning, hidden = self._decoder_rnn(c.view(1, -1), hidden)
+    return meaning.view(-1)  # proba
+
+  @classmethod
+  def LearnSpeakerHearerSupervised(
+      cls, speaker, hearer, speaker_meaning, message, hearer_meaning):
+    # print 'speaker_meaning', speaker_meaning
+    # print 'message (%u)' % len(message), torch.stack(message)
+    # print 'hearer_meaning', hearer_meaning
+    
+    # loss = F.nll_loss(
+    #   hearer_meaning.view(1, -1),
+    #   torch.LongTensor([Iterables.Index(MEANINGS, speaker_meaning, MEANINGS.Equal)]))
+    speaker_meaning = torch.tensor(speaker_meaning, dtype=torch.uint8)
+    loss = MEANINGS.Distance(speaker_meaning, hearer_meaning)
+    speaker._encoder_optimizer.zero_grad()
+    hearer._decoder_optimizer.zero_grad()
+    loss.backward()
+    speaker._encoder_optimizer.step()
+    hearer._decoder_optimizer.step()
+
+    # print 'encoder'
+    # for name, p in speaker._encoder_rnn.named_parameters():
+    #   print name, p.grad
+    # print 'decoder'
+    # for name, p in hearer._decoder_rnn.named_parameters():
+    #   print name, p.grad
+
+  # _VOCABULARY = list(MESSAGES) + ['STOP']
+  _VOCABULARY = ['0', '1']
+
+Agent._AGENT_REGISTRY['encoder-decoder-rnns'] = EncoderDecoderRecurrentNetworksAgent
+
+class RNN(torch.nn.Module):
+
+  @classmethod
+  def Create(cls, input_size, hidden_size, output_size):
+    rnn = torch.nn.LSTM(input_size, hidden_size)
+    h2o = torch.nn.Linear(hidden_size, output_size)
+    return cls(rnn, h2o)
+
+  def __init__(self, rnn, h2o):
+    super(RNN, self).__init__()
+    self.rnn = rnn
+    self.h2o = h2o
+
+  def forward(self, input, state):
+    hidden, state = self.rnn(
+      input.view(-1).view(1, 1, -1),
+      state)
+    # assert (_ == hidden).all().item()
+    hidden = hidden.view(-1).view(1, -1)
+    output = F.softmax(self.h2o(hidden), dim=-1)
+    return output, state
+
+
+# class RNN(torch.nn.Module):
+
+#   @classmethod
+#   def Create(cls, input_size, hidden_size, output_size):
+#     ih2h = torch.nn.Linear(input_size + hidden_size, hidden_size)
+#     # h2h = torch.nn.Linear(hidden_size, hidden_size)
+#     h2o = torch.nn.Linear(hidden_size, output_size)
+#     return cls(ih2h, h2o)
+
+#   def __init__(self, ih2h, h2o):
+#     super(RNN, self).__init__()
+#     self.ih2h = ih2h
+#     self.h2o = h2o
+
+#   def forward(self, input, hidden):
+#     hidden = torch.tanh(self.ih2h(torch.cat([input, hidden], dim=1)))
+#     output = F.softmax(self.h2o(hidden), dim=-1)
+#     return output, hidden
+
+
 # TODO: Clean up.
 class AgentTraining(object):
-  """Agent training method. Calls relevant Agent method, eg. LearnSupervised."""
+  """Agent training method.
+
+  A functor that represents / delegates to relevant Agent method(s),
+  eg. LearnToHearSupervised, behind unified interface TrainAgents().
+  """
 
   @classmethod
   def FromFlags(cls):
     if FLAGS.agent_training == 'supervised':
       return AgentSupervisedTraining()
+    if FLAGS.agent_training == 'joint-supervised':
+      return AgentJointSupervisedTraining()
     elif FLAGS.agent_training == 'unsupervised':
       return AgentUnsupervisedTraining()
     elif FLAGS.agent_training == 'reinforcement':
@@ -455,15 +682,32 @@ class AgentTraining(object):
       raise ValueError(FLAGS.agent_training)
 
   def TrainAgents(self, communication_act):
-   raise NotImplementedError
-
+    raise NotImplementedError
+ 
+  def _SpeakerActs(self, communication_acts):
+    return Iterables.GroupBy(communication_acts, lambda ca: ca.speaker)
+ 
+  def _HearerActs(self, communication_acts):
+    return Iterables.GroupBy(communication_acts, lambda ca: ca.hearer)
+    
 class AgentSupervisedTraining(AgentTraining):
 
-  def TrainAgents(self, communication_act):
-   communication_act.hearer.LearnSupervised(
-     communication_act.speaker_meaning,
-     communication_act.message,
-     communication_act.hearer_meaning)
+  def TrainAgents(self, communication_acts):
+    for hearer, hearer_acts in self._HearerActs(communication_acts):
+      hearer.LearnToHearSupervised(
+        [ha.message for ha in hearer_acts],
+        [ha.hearer_meaning for ha in hearer_acts],
+        [ha.speaker_meaning for ha in hearer_acts])
+    # TODO: LearnToSpeakSupervised.
+
+class AgentJointSupervisedTraining(AgentTraining):
+
+  def TrainAgents(self, communication_acts):
+    for ca in communication_acts:
+      assert type(ca.speaker) is type(ca.hearer)
+      type(ca.speaker).LearnSpeakerHearerSupervised(
+        ca.speaker, ca.hearer,
+        ca.speaker_meaning, ca.message, ca.hearer_meaning)
 
 class AgentReinforcementTraining(AgentTraining):
 
@@ -473,7 +717,7 @@ class AgentReinforcementTraining(AgentTraining):
     #     [sa.speaker_meaning for sa in speaker_acts],
     #     [sa.message for sa in speaker_acts],
     #     [self._ComputeReward(sa) for sa in speaker_acts])
-    for hearer, hearer_acts in Iterables.GroupBy(communication_acts, lambda ca: ca.hearer):
+    for hearer, hearer_acts in self._HearerActs(communication_acts):
       hearer.LearnToHearReinforced(
         [ha.message for ha in hearer_acts],
         [ha.hearer_meaning for ha in hearer_acts],
@@ -550,7 +794,7 @@ class BinaryVectorSpace(Space):
     Returns:
       float.
     """
-    return ((a - b)**2).mean()
+    return ((a - b)**2).mean(axis=-1)
 
   @staticmethod
   def Equal(a, b):
@@ -671,6 +915,11 @@ class IteratedLearning(object):
       # Have each agent learn from his samples.
       self._agent_training.TrainAgents(communication_acts)
 
+      # Online training. TODO: Remove.
+      # for _ in xrange(self._num_communication_acts):
+      #   communication_act = self._DoCommunicationAct()
+      #   self._agent_training.TrainAgents([communication_act])
+
       # Update agent population.
       self._agents, new_agents = (
         self._agent_replacement_strategy.AddRemoveAgents(self._agents))
@@ -715,7 +964,7 @@ class IteratedLearning(object):
 
 """A record of the following communication act:
 
-meaning  -- speaker.Speak(.) -->  message  -- hearer.Hear(.)  -->  meaning
+meaning  -- speaker.Speak(.) -->  message  -- hearer.Hear(.) -->  meaning
 """
 CommunicationAct = collections.namedtuple('CommunicationAct', [
   'speaker', 'hearer', 'speaker_meaning', 'message', 'hearer_meaning'])
@@ -806,9 +1055,16 @@ class CommunicationAccuracy(Metric):
       hearer, speaker = _RandomChoice(agents, 2, replace=False)
       speaker_meaning = _RandomChoice(MEANINGS)
       hearer_meaning = hearer.Hear(speaker.Speak(speaker_meaning))
+      # TODO: Remove.
+      hearer_meaning = _OneHot(hearer_meaning.argmax().item(), MEANINGS.num_bits)
       num_successful += int(MEANINGS.Equal(speaker_meaning, hearer_meaning))
     return num_successful / self._num_samples
- 
+
+def _OneHot(index, size, package=np, dtype=np.uint8):
+  one_hot = package.zeros(size, dtype=dtype)
+  one_hot[index] = 1
+  return one_hot
+  
 
 def PlotDialectMaps(language):
   # language: generations x meanings x agents x message bits
@@ -851,9 +1107,11 @@ class Dicts(object):
 class Iterables(object):
         
   @classmethod
-  def Index(cls, iterable, key):
+  def Index(cls, iterable, key, equal_func=None):
+    if equal_func is None:
+      equal_func = operator.eq
     for i, e in enumerate(iterable):
-      if e == key:
+      if equal_func(e, key):
         return i
     raise KeyError(key)
 
